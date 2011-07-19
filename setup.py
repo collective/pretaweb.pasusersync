@@ -3,9 +3,9 @@ import os
 
 version = '1.0'
 
-setup(name='pretaweb.ldapusersync',
+setup(name='pretaweb.pasusersync',
       version=version,
-      description="Automate membrane user creation and deletion based on ldap users",
+      description="Automate syncronization between pas plugins.",
       long_description=open("README.txt").read() + "\n" +
                        open(os.path.join("docs", "HISTORY.txt")).read(),
       # Get more strings from

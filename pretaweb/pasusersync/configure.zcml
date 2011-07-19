@@ -37,8 +37,11 @@
     factory=".ldapusersync.MembraneDisabler"
     />
 
-    <utility
-        factory=".facultydirectoryadder.FacultyDirectoryUserAdder"/>
+    <!-- seems missing ??
+	    <utility
+		factory=".facultydirectoryadder.FacultyDirectoryUserAdder"/>
+
+    -->
 
 
     <browser:page
