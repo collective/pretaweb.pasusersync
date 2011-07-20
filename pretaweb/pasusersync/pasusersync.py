@@ -7,7 +7,7 @@ from Products.PluggableAuthService.interfaces.plugins import IAuthenticationPlug
 from Products.PluggableAuthService.utils import classImplements
 from Products.PluggableAuthService.plugins.BasePlugin import BasePlugin
 from Products.PlonePAS.interfaces.plugins import IUserIntrospection
-from interfaces import ILDAPUserSync, IUserAdder, IUserDisabler
+from interfaces import IPASUserSync, IUserAdder, IUserDisabler
 
 try:
     from Products.PluggableAuthService import _SWALLOWABLE_PLUGIN_EXCEPTIONS
@@ -15,23 +15,22 @@ except ImportError:  # in case that private const goes away someday
     _SWALLOWABLE_PLUGIN_EXCEPTIONS = NameError, AttributeError, KeyError, TypeError, ValueError
 
 
-#class LDAPUserSyncView(BrowserView):
+#class PASUserSyncView(BrowserView): 
 
 
 
 
 
-
-class LDAPUserSync(object):
+class PASUserSync(object):
     """
     BelronUserProps browser view
     """
-    implements(ILDAPUserSync)
+    implements(IPASUserSync)
 
     def __init__(self, context):
         self.context = context
 
-    def sync_ldap(self, from_plugin, to_plugin):
+    def sync_pas(self, from_plugin, to_plugin):
         """ Plan is to enumberate all users and then compare them and see which plugin they come from
             For any that aren't in all plugins, do add or remove
         """
@@ -60,17 +59,17 @@ class LDAPUserSync(object):
         return getToolByName(self.context, 'portal_url').getPortalObject()
 
 
-    def listAllLDAPUsers(self):
+    def listAllPASUsers(self):
         """
         List all user's in AD
         """
-       #self.luf = self.context.acl_users.ad.acl_users #LDAPUserFolder instance
+       #self.luf = self.context.acl_users.ad.acl_users #PASUserFolder instance
         return self.luf.searchUsers(cn='',objectClass='top;person;organizationalPerson;user')
 
 
-    def synchroniseLDAPUsers(self):
+    def synchronisePASUsers(self):
         """
-        Synchronise the Plone users with the LDAP server
+        Synchronise the Plone users with the PAS server
         """
         usersAdded = []
         usersSynced = {}
@@ -79,8 +78,8 @@ class LDAPUserSync(object):
         #for user in self.context.users.objectIds('BelronUser'):
         #    existingUsers.append(user)
         #self.context.plone_log(existingUsers)
-        for ldapuser in self.listAllLDAPUsers():
-            login = ldapuser.get('sAMAccountName')
+        for pasuser in self.listAllPASUsers():
+            login = pasuser.get('sAMAccountName')
             if login is not None:
                 # This is what PAS expects teh login to be
                 login = 'obrien\\'+login.lower() # the way IIS formats the login
@@ -97,13 +96,13 @@ class LDAPUserSync(object):
                 else:
                     #now get plones concept of the userId
                     userId = user.getId()
-                    usersSynced[login] = self.syncProps(userId, ldapuser)
+                    usersSynced[login] = self.syncProps(userId, pasuser)
 
                 # Remove userid that exists in AD as well as in Plone
                 #if userId in existingUsers:
                 #    existingUsers.remove(userId)
                 # Disable the users that have been disabled in AD
-                #if str(ldapuser.get('userAccountControl')) == '514':
+                #if str(pasuser.get('userAccountControl')) == '514':
                 #    if self.handleDisable(userId, True):
                 #        usersDisabled.append(login)
                 # Disable the users that no longer exist in AD
@@ -178,17 +177,17 @@ class PASUserAdder(object):
         member.setMemberProperties({'login_time': now, 'last_login_time': lastLoginTime})
 
 
-    def syncProps(self, userId, ldapuser):
+    def syncProps(self, userId, pasuser):
         """Sync Plone user attributes"""
         membershipTool = getToolByName(self.context, 'portal_membership')
         membraneTool = getToolByName(self.context, 'membrane_tool')
         member = membershipTool.getMemberById(userId)
         newprops = {}
         for attrib,field in config.AttributeMappings.items():
-            if ldapuser.get(attrib):
-                newprops[field] = ldapuser.get(attrib)
+            if pasuser.get(attrib):
+                newprops[field] = pasuser.get(attrib)
         addParts = ['streetAddress','l','st','postalCode','postOfficeBox']
-        officeAddress = [ldapuser.get(f) for f in addParts if ldapuser.get(f)]
+        officeAddress = [pasuser.get(f) for f in addParts if pasuser.get(f)]
         if officeAddress:
             officeAddress = ', '.join(officeAddress)
             newprops['officeAddress'] = officeAddress
@@ -221,15 +220,15 @@ class MembraneDisabler(object):
 
 
 
-class LDAPUserSyncView(BrowserView):
+class PASUserSyncView(BrowserView):
 
     def __call__(self, *args, **kwargs):
         from_plugin = 'ldap'
         to_plugin = 'membrane_users'
 
 
-        syncer = ILDAPUserSync(self.context)
-        adds, removes = syncer.sync_ldap(from_plugin, to_plugin)
+        syncer = IPASUserSync(self.context)
+        adds, removes = syncer.sync_pas(from_plugin, to_plugin)
         adder = IUserAdder(self.context)
         remover = IUserDisabler(self.context)
         for user in adds:

@@ -2,15 +2,15 @@ from zope.component import Interface
 
 
 
-class ILDAPUserSync(Interface):
+class IPASUserSync(Interface):
     """ Produces a list ldap users which should be added or deleted or updated
     """
 
-    def diff_ldap():
+    def diff_pas():
         """  @return a tuple of adds, removes
         """
 
-    def sync_ldap():
+    def sync_pas():
         """ Compare ldap user list to the PAS user list and call IUserDisabler and IUserAdder as needed
         """
 
