@@ -20,34 +20,35 @@
 
 
     <adapter
-    for="Products.CMFPlone.interfaces.IPloneSiteRoot"
-    provides=".interfaces.PASUserSync"
-    factory=".pasusersync.PASUserSync"
-    />
+            for="Products.PluggableAuthService.interfaces.plugins.IUserEnumerationPlugin
+                 Products.PluggableAuthService.interfaces.plugins.IUserEnumerationPlugin"
+            provides=".interfaces.IPASUserSync"
+            factory=".pasusersync.PASUserSync" />
 
     <adapter
-    for="Products.CMFPlone.interfaces.IPloneSiteRoot"
-    provides=".interfaces.IUserAdder"
-    factory=".pasusersync.PASUserAdder"
-    />
+            for="Products.LDAPMultiPlugins.interfaces.ILDAPMultiPlugin
+                 Products.membrane.interfaces.plugins.IMembraneUserManagerPlugin"
+            provides=".interfaces.IPASUserAdder"
+            factory=".ldaptomembrane.MembraneUserAdder" />
 
     <adapter
-    for="Products.CMFPlone.interfaces.IPloneSiteRoot"
-    provides=".interfaces.IUserDisabler"
-    factory=".pasusersync.MembraneDisabler"
-    />
+            for="Products.LDAPMultiPlugins.interfaces.ILDAPMultiPlugin
+                 Products.membrane.interfaces.plugins.IMembraneUserManagerPlugin"
+            provides=".interfaces.IPASUserDisabler"
+            factory=".ldaptomembrane.MembraneUserDisabler" />
 
+<!--
     <utility
 	factory=".facultydirectoryadder.FacultyDirectoryUserAdder"/>
+-->
 
 
 
     <browser:page
-      for="Products.CMFPlone.interfaces.IPloneSiteRoot"
-      name="pas-sync"
-      class=".pasusersync.PASUserSyncView"
-      permission="cmf.ManagePortal"
-      allowed_attributes="template"
-      />
+              for="Products.CMFPlone.interfaces.IPloneSiteRoot"
+              name="pas-sync"
+              class=".pasusersync.PASUserSyncView"
+              permission="cmf.ManagePortal"
+              allowed_attributes="template"   />
 
 </configure>

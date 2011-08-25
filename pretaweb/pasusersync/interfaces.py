@@ -3,27 +3,23 @@ from zope.component import Interface
 
 
 class IPASUserSync(Interface):
-    """ Produces a list ldap users which should be added or deleted or updated
+    """ Produces a list users which should be added or deleted or updated
     """
 
-    def diff_pas():
+    def pass_diff():
         """  @return a tuple of adds, removes
         """
 
-    def sync_pas():
-        """ Compare ldap user list to the PAS user list and call IUserDisabler and IUserAdder as needed
-        """
-
-class IUserDisabler(Interface):
+class IPASUserDisabler(Interface):
     """ Hookpoint for customising how to disable a user in your site """
 
-    def disable_user(userid, pluginid=None):
-        """ disable or remove the user from the db after they disapear from ldap """
+    def disable_user(self, userid):
+        """ disable or remove the user from the db after they disapear from the alternate PAS plugin """
 
-class IUserAdder(Interface):
+class IPASUserAdder(Interface):
     """ Implement site specific actions to add a ldap user profile to your site """
 
-    def add_user(self, userid, pluginid=None):
+    def add_user(self, userid, from_plugin=None):
         """ Take user information from one PASPlugin and setup your site to reflect that users existance """
         
 

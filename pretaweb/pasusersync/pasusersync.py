@@ -1,13 +1,14 @@
 from zope.interface import implements, Interface
+from zope.component import getMultiAdapter
 
 from Products.Five import BrowserView
 from Products.CMFCore.utils import getToolByName
 from Products.PluggableAuthService.PluggableAuthService import logger
-from Products.PluggableAuthService.interfaces.plugins import IAuthenticationPlugin, IUserAdderPlugin, IRoleAssignerPlugin
 from Products.PluggableAuthService.utils import classImplements
 from Products.PluggableAuthService.plugins.BasePlugin import BasePlugin
 from Products.PlonePAS.interfaces.plugins import IUserIntrospection
-from interfaces import IPASUserSync, IUserAdder, IUserDisabler
+from interfaces import IPASUserAdder, IPASUserDisabler, IPASUserSync
+import OFS.Cache
 
 try:
     from Products.PluggableAuthService import _SWALLOWABLE_PLUGIN_EXCEPTIONS
@@ -18,39 +19,38 @@ except ImportError:  # in case that private const goes away someday
 #class PASUserSyncView(BrowserView): 
 
 
-
-
-
 class PASUserSync(object):
     """
     BelronUserProps browser view
     """
     implements(IPASUserSync)
 
-    def __init__(self, context):
-        self.context = context
+    def __init__(self, from_ctx, to_ctx):
+        self.from_ctx = from_ctx
+        self.to_ctx = to_ctx
 
-    def sync_pas(self, from_plugin, to_plugin):
+    def pas_diff(self):
         """ Plan is to enumberate all users and then compare them and see which plugin they come from
             For any that aren't in all plugins, do add or remove
         """
         #lister = IUserEnumerationPlugin
-        user_list = self.context.acl_users.searchUsers() #this could be bad for performance
-        user_map = {}
-        for user in user_list:
-            login = user['login']
-            id= user['id']
-            pluginid = user['pluginid']
-            user_map.setdefault(login,{})[pluginid] = user
-        adds = []
-        removes = []
-        for login,plugins in user_map.items():
-            if from_plugin in plugins and to_plugin not in plugins:
-                adds.append(plugins[from_plugin]['login'])
-            elif from_plugin not in plugins and to_plugin in plugins:
-                removes.append(plugins[to_plugin]['login'])
-        return (adds,removes)
 
+        if isinstance(self.from_ctx, OFS.Cache.Cacheable):
+            self.from_ctx.ZCacheable_invalidate ()
+        if isinstance(self.to_ctx, OFS.Cache.Cacheable):
+            self.to_ctx.ZCacheable_invalidate ()
+
+
+        from_logins = [u["login"] for u in self.from_ctx.enumerateUsers()]
+        from_logins = set(from_logins)
+
+        to_logins = [u["login"] for u in self.to_ctx.enumerateUsers()]
+        to_logins = set(to_logins)
+
+        adds = from_logins - to_logins
+        removes = to_logins - from_logins
+
+        return list(adds), list(removes)
 
 
 
@@ -114,125 +114,29 @@ class PASUserSync(object):
 
 
 
-
-class PASUserAdder(object):
-    implements(IUserAdder)
-
-    def __init__(self, context):
-        self.context = context
-
-    def add_user(self, login, pluginid=None):
-        """Make a user with id `userId`, and assign him the Member role."""
-
-        # I could just call self.context.acl_users._doAddUser(...), but that's private and not part of the IPluggableAuthService interface. It might break someday. So the following is based on PluggableAuthService._doAddUser():
-            
-        # Make sure we actually have user adders and role assigners. It would be ugly to succeed at making the user but be unable to assign him the role.
-        userAdders = self.context.acl_users.plugins.listPlugins(IUserAdderPlugin)
-        if not userAdders:
-            raise NotImplementedError("I wanted to make a new user, but there are no PAS plugins active that can make users.")
-        roleAssigners = self.context.acl_users.plugins.listPlugins(IRoleAssignerPlugin)
-        if not roleAssigners:
-            raise NotImplementedError("I wanted to make a new user and give him the Member role, but there are no PAS plugins active that assign roles to users.")
-        
-        # Add the user to the first IUserAdderPlugin that works:
-        generatePassword = getToolByName(self.context, 'portal_registration').generatePassword
-        user = None
-        for adder_id, curAdder in userAdders:
-            if pluginid is not None and adder_id != pluginid:
-                continue
-            if curAdder.doAddUser(login, generatePassword()):  # Assign a dummy password. It'll never be used if you're using apachepas to delegate authentication to Apache.
-                user = self.context.acl_users.getUser(login)
-                break
-            
-        # Map the Member role to the user using all available IRoleAssignerPlugins (just like doAddUser does for some reason):
-        for curAssignerId, curAssigner in roleAssigners:
-            try:
-                curAssigner.doAssignRoleToPrincipal(user.getId(), 'Member')
-            except _SWALLOWABLE_PLUGIN_EXCEPTIONS:
-                logger.debug('RoleAssigner %s error' % curAssignerId, exc_info=True)
-
-        #now get plones concept of the userId
-        userId = user.getId()
-        #membershipTool.setLoginTimes()  # Doesn't work, because it explicitly checks to see if membershipTool.isAnonymousUser() and bails out since we are, at this point, anonymous (because apachepas (or whatever IAuthenticationPlugin you're using) hasn't done its thing yet).
-        self.setLoginTimes(userId)  # lets the user show up in member searches. We do this only when we first create the member. This means the login times are less accurate than in a stock Plone with form-based login, in which the times are set at each login. However, if we were to set login times at each request, that's an expensive DB write at each, and lots of ConflictErrors happen.
-        # Do the stuff normally done in the logged_in page (for some silly reason). Unfortunately, we'll be doing this for each authenticated request rather than just at login. Optimize if necessary:
-        membershipTool = getToolByName(self.context, 'portal_membership')
-        membershipTool.createMemberArea(member_id=userId)
-
-        return user
-
-
-    def setLoginTimes(self, userId):
-        """Do what the logged_in script usually does, with regard to login times, to users after they log in."""
-        # Ripped off and simplified from CMFPlone.MembershipTool.MembershipTool.setLoginTimes():
-        membershipTool = getToolByName(self.context, 'portal_membership')
-        member = membershipTool.getMemberById(userId)
-        now = self.context.ZopeTime()
-        defaultDate = '2000/01/01'
-            
-        # Duplicate mysterious logic from MembershipTool.py:
-        lastLoginTime = member.getProperty('login_time', defaultDate)  # In Plone 2.5, 'login_time' property is DateTime('2000/01/01') when a user has never logged in, so this default never kicks in. However, I'll assume it was in the MembershipTool code for a reason.
-        if str(lastLoginTime) == defaultDate:
-            lastLoginTime = now
-        member.setMemberProperties({'login_time': now, 'last_login_time': lastLoginTime})
-
-
-    def syncProps(self, userId, pasuser):
-        """Sync Plone user attributes"""
-        membershipTool = getToolByName(self.context, 'portal_membership')
-        membraneTool = getToolByName(self.context, 'membrane_tool')
-        member = membershipTool.getMemberById(userId)
-        newprops = {}
-        for attrib,field in config.AttributeMappings.items():
-            if pasuser.get(attrib):
-                newprops[field] = pasuser.get(attrib)
-        addParts = ['streetAddress','l','st','postalCode','postOfficeBox']
-        officeAddress = [pasuser.get(f) for f in addParts if pasuser.get(f)]
-        if officeAddress:
-            officeAddress = ', '.join(officeAddress)
-            newprops['officeAddress'] = officeAddress
-
-        #remove properties that haven't changed
-        newprops = dict([(k,v) for k,v in newprops.items() if member.getProperty(k)!=v])
-
-        if newprops:
-            member.setMemberProperties(newprops)
-            membraneTool.reindexObject(membraneTool)
-        return newprops
-
-
-class MembraneDisabler(object):
-    implements(IUserDisabler)
-
-    def __init__(self, context):
-        self.context = context
-
-    def disable_user(self, userid):
-        """Disable applicable users"""
-        self.context.plone_log(userId)
-        if always_disable:
-            ob = getattr(self.context.users, userId)
-            rs = self.context.portal_workflow.getInfoFor(ob, 'review_state')
-            if rs != 'disabled':
-                self.context.portal_workflow.doActionFor(ob, 'disable')
-                return True
-        return False
-
-
-
 class PASUserSyncView(BrowserView):
 
     def __call__(self, *args, **kwargs):
         from_plugin = 'ldap'
         to_plugin = 'membrane_users'
 
+        from_ctx = getattr (self.context.acl_users, from_plugin)
+        to_ctx = getattr (self.context.acl_users, to_plugin)
 
-        syncer = IPASUserSync(self.context)
-        adds, removes = syncer.sync_pas(from_plugin, to_plugin)
-        adder = IUserAdder(self.context)
-        remover = IUserDisabler(self.context)
+
+        if not (from_ctx and to_ctx):
+            raise Exception ("PAS-Sync plugin configuration error")
+
+
+        syncer = getMultiAdapter ((from_ctx, to_ctx),IPASUserSync)
+
+        adds, removes = syncer.pas_diff ()
+        adder = getMultiAdapter ((from_ctx, to_ctx),IPASUserAdder)
+        remover = getMultiAdapter ((from_ctx, to_ctx),IPASUserDisabler)
         for user in adds:
-            adder.add_user(user, to_plugin)
+            adder.add_user(user)
         for user in removes:
-            remover.disable_user(user, from_plugin)
+            remover.disable_user(user)
         return "adds=%s, removes=%s" % (adds,removes)
+
+
