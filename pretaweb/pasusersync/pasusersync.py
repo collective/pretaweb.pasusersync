@@ -1,142 +1,213 @@
-from zope.interface import implements, Interface
-from zope.component import getMultiAdapter
 
-from Products.Five import BrowserView
+import logging
+
 from Products.CMFCore.utils import getToolByName
-from Products.PluggableAuthService.PluggableAuthService import logger
-from Products.PluggableAuthService.utils import classImplements
-from Products.PluggableAuthService.plugins.BasePlugin import BasePlugin
-from Products.PlonePAS.interfaces.plugins import IUserIntrospection
-from interfaces import IPASUserAdder, IPASUserDisabler, IPASUserSync
-import OFS.Cache
-
-try:
-    from Products.PluggableAuthService import _SWALLOWABLE_PLUGIN_EXCEPTIONS
-except ImportError:  # in case that private const goes away someday
-    _SWALLOWABLE_PLUGIN_EXCEPTIONS = NameError, AttributeError, KeyError, TypeError, ValueError
+from Products.Five import BrowserView
+from Products.PluggableAuthService.interfaces.plugins import IUserAdderPlugin, IPropertiesPlugin
+from Products.PlonePAS.sheet import MutablePropertySheet
 
 
-#class PASUserSyncView(BrowserView): 
+class PASUserSync(BrowserView):
+
+    def __init__ (self, *args, **kwargs):
+        BrowserView.__init__ (self, *args, **kwargs)
+        self.portal = getToolByName(self.context, "portal_url")  .getPortalObject()
 
 
-class PASUserSync(object):
-    """
-    BelronUserProps browser view
-    """
-    implements(IPASUserSync)
+    def __call__ (self):
 
-    def __init__(self, from_ctx, to_ctx):
-        self.from_ctx = from_ctx
-        self.to_ctx = to_ctx
+        request = self.request
+        portal = getToolByName(self.context, "portal_url")  .getPortalObject()
+        listPlugins = portal.acl_users.plugins.listPlugins
 
-    def pas_diff(self):
-        """ Plan is to enumberate all users and then compare them and see which plugin they come from
-            For any that aren't in all plugins, do add or remove
-        """
-        #lister = IUserEnumerationPlugin
+        # Get paramitors and corrispondign objects
 
-        if isinstance(self.from_ctx, OFS.Cache.Cacheable):
-            self.from_ctx.ZCacheable_invalidate ()
-        if isinstance(self.to_ctx, OFS.Cache.Cacheable):
-            self.to_ctx.ZCacheable_invalidate ()
+        from_pluginid = request.get ("from")
+        to_pluginid = request.get("to")
 
-
-        from_logins = [u["login"] for u in self.from_ctx.enumerateUsers()]
-        from_logins = set(from_logins)
-
-        to_logins = [u["login"] for u in self.to_ctx.enumerateUsers()]
-        to_logins = set(to_logins)
-
-        adds = from_logins - to_logins
-        removes = to_logins - from_logins
-
-        return list(adds), list(removes)
+        # Allowing for more specific definition of the to property manager and
+        # user manager
+        if to_pluginid is None:
+            to_properties_pluginid = request.get("to_properties")
+            to_manager_pluginid = request.get("to_manager")
+        else:
+            to_properties_pluginid = to_pluginid
+            to_manager_pluginid = to_pluginid
 
 
+        # Get plugin objects
 
-    @property
-    def portal(self):
-        return getToolByName(self.context, 'portal_url').getPortalObject()
+        from_properties_plugin = None
+        to_properties_plugin = None
+        to_manager_plugin = None
+
+        for pluginId, p in listPlugins(IPropertiesPlugin):
+            if p.id == from_pluginid:
+                from_properties_plugin = p
+            elif pluginId == to_properties_pluginid:
+                to_properties_plugin = p
 
 
-    def listAllPASUsers(self):
-        """
-        List all user's in AD
-        """
-       #self.luf = self.context.acl_users.ad.acl_users #PASUserFolder instance
-        return self.luf.searchUsers(cn='',objectClass='top;person;organizationalPerson;user')
+        for pluginId, p in listPlugins(IUserAdderPlugin):
+            if pluginId == to_manager_pluginid:
+                to_manager_plugin = p
+                break;
 
 
-    def synchronisePASUsers(self):
-        """
-        Synchronise the Plone users with the PAS server
-        """
-        usersAdded = []
-        usersSynced = {}
-        usersDisabled = []
-        existingUsers = []
-        #for user in self.context.users.objectIds('BelronUser'):
-        #    existingUsers.append(user)
-        #self.context.plone_log(existingUsers)
-        for pasuser in self.listAllPASUsers():
-            login = pasuser.get('sAMAccountName')
-            if login is not None:
-                # This is what PAS expects teh login to be
-                login = 'obrien\\'+login.lower() # the way IIS formats the login
-                user = self.context.acl_users.getUser(login)
-                if user is None:  # user doesn't exist
-                    user = self.makeMember(login)
-                    #now get plones concept of the userId
-                    userId = user.getId()
-                    #membershipTool.setLoginTimes()  # Doesn't work, because it explicitly checks to see if membershipTool.isAnonymousUser() and bails out since we are, at this point, anonymous (because apachepas (or whatever IAuthenticationPlugin you're using) hasn't done its thing yet).
-                    self.setLoginTimes(userId, membershipTool)  # lets the user show up in member searches. We do this only when we first create the member. This means the login times are less accurate than in a stock Plone with form-based login, in which the times are set at each login. However, if we were to set login times at each request, that's an expensive DB write at each, and lots of ConflictErrors happen.
-                    # Do the stuff normally done in the logged_in page (for some silly reason). Unfortunately, we'll be doing this for each authenticated request rather than just at login. Optimize if necessary:
-                    membershipTool.createMemberArea(member_id=userId)
-                    usersAdded.append(login)
+        # Check we have everything
+
+        if not (to_manager_plugin and to_properties_plugin and from_properties_plugin):
+            raise Exception ("Cound not find needed plugin")
+
+
+        # Do Sync
+
+        return self.sync (from_properties_plugin, to_manager_plugin, to_properties_plugin,)
+
+
+
+    #
+    # Syncing
+    #
+
+    def sync (self, from_properties, to_manager, to_properties):
+
+
+        # Stats
+        cadds = 0
+        cremoves = 0
+        cupdates = 0
+        cnotupdates = 0
+
+        doneUsers = set()
+        for userInfo in self.portal.acl_users.searchUsers():
+
+            # Do sync opertaions on a valid and not-done user
+            uid = userInfo["id"]
+            if uid not in doneUsers:
+                doneUsers.add (uid)
+
+
+                user = self.getUser(uid)
+                if user is None:
+                    logging.info ("could not sync id: %s", uid)
                 else:
-                    #now get plones concept of the userId
-                    userId = user.getId()
-                    usersSynced[login] = self.syncProps(userId, pasuser)
+                    logging.info ("syncing id: %s", uid)
 
-                # Remove userid that exists in AD as well as in Plone
-                #if userId in existingUsers:
-                #    existingUsers.remove(userId)
-                # Disable the users that have been disabled in AD
-                #if str(pasuser.get('userAccountControl')) == '514':
-                #    if self.handleDisable(userId, True):
-                #        usersDisabled.append(login)
-                # Disable the users that no longer exist in AD
-                #for userId in existingUsers:
-                #    if self.handleDisable(userId, True):
-                #        usersDisabled.append(userId)
- 
-        return {'usersAdded': usersAdded, 'usersSynced': usersSynced, 'usersDisabled': usersDisabled}
+                    # if None is returned from the followign, that would mean
+                    # the plugin does not manage that user
+                    fprop = self.getPropertiesForUser (from_properties, user)
+                    tprop = self.getPropertiesForUser (to_properties, user)
 
 
+                    # Operation on the user - update, add, remove, noop.
+                    # Operation is determined by which pluging returns valid
+                    # property sheets. 
+                    if fprop and tprop:
+                        if self.sync_update (user, fprop, tprop):
+                            logging.info ("updated id: %s", uid)
+                            cupdates += 1
+                        else:
+                            logging.info ("id: %s is up to date", uid)
+                            cnotupdates += 1
 
-class PASUserSyncView(BrowserView):
+                    elif fprop and (tprop is None):
+                        self.sync_add (uid, to_manager, fprop, to_properties)
+                        logging.info ("added id: %s", uid)
+                        cadds += 1
 
-    def __call__(self, *args, **kwargs):
-        from_plugin = 'ldap'
-        to_plugin = 'membrane_users'
+                    elif (fprop is None) and tprop:
+                        self.sync_remove (uid, to_manager)
+                        logging.info ("removed id: %s", uid)
+                        cremoves += 1
 
-        from_ctx = getattr (self.context.acl_users, from_plugin)
-        to_ctx = getattr (self.context.acl_users, to_plugin)
+                    else:
+                        # noop - Do nothing
+                        logging.info ("sync not required for id: %s", uid)
+                        cnotupdates += 1
 
 
-        if not (from_ctx and to_ctx):
-            raise Exception ("PAS-Sync plugin configuration error")
+        return "adds=%s updates=%s removes=%s not_updated=%s" % (cadds, cupdates, cremoves, cnotupdates)
 
 
-        syncer = getMultiAdapter ((from_ctx, to_ctx),IPASUserSync)
 
-        adds, removes = syncer.pas_diff ()
-        adder = getMultiAdapter ((from_ctx, to_ctx),IPASUserAdder)
-        remover = getMultiAdapter ((from_ctx, to_ctx),IPASUserDisabler)
-        for user in adds:
-            adder.add_user(user)
-        for user in removes:
-            remover.disable_user(user)
-        return "adds=%s, removes=%s" % (adds,removes)
+
+    #
+    # Sync Opertions
+    #
+
+
+    def sync_update (self, user, fprop, tprop):
+        updated = False
+
+        if isinstance (tprop, MutablePropertySheet):
+
+            tpropMap = tprop.propertyMap()
+            tkeys = set([propInfo["id"] for propInfo in tpropMap])
+
+            # iterate from properties
+            fpropMap = fprop.propertyMap()
+            for propInfo in fpropMap:
+                key = propInfo["id"]
+                if key in tkeys:
+                    fvalue = fprop.getProperty(key)
+                    tvalue = tprop.getProperty(key)
+                    
+                    # compare value, is diff then update
+                    if fvalue != tvalue:
+                        tprop.setProperty (user, key, fvalue)
+                        updated = True
+
+        return updated
+
+
+    def sync_add (self, uid, to_manager, fprop, to_properties):
+        password = getToolByName(self.portal, 'portal_registration').generatePassword ()
+
+        # do the deed
+        to_manager.doAddUser (uid, password)
+
+        # roperties Update
+        user = self.getUser(uid)
+        tprop = self.getPropertiesForUser (to_properties, user)
+        self.sync_update (user, fprop, tprop)
+
+
+
+
+    def sync_remove (self, uid, to_manager):
+        to_manager.doDeleteUser (uid)
+
+
+
+
+    #
+    # Helper functions to retreive users and their properties
+    #
+
+
+    def getUser (self, uid):
+        try:
+            user = self.portal.acl_users.getUser(uid)
+        except:
+            logging.error ("error in getting user")
+            user = None
+        return user
+    
+
+    def getPropertiesForUser (self, plugin, user):
+        try:
+            prop = plugin.getPropertiesForUser(user)
+        except:
+            prop = None
+
+        if prop and prop.hasProperty("fullname"): 
+            return prop
+        else:
+            import pdb; pdb.set_trace()
+            return None
+            
+
+
 
 
