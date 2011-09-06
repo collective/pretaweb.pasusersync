@@ -3,9 +3,9 @@ import logging
 
 from Products.CMFCore.utils import getToolByName
 from Products.Five import BrowserView
-from Products.PluggableAuthService.interfaces.plugins import IUserAdderPlugin, IPropertiesPlugin
+from Products.PluggableAuthService.interfaces.plugins import IUserAdderPlugin, IPropertiesPlugin, IUserFactoryPlugin
 from Products.PlonePAS.sheet import MutablePropertySheet
-
+from Products.Archetypes.config import REFERENCE_CATALOG
 
 class PASUserSync(BrowserView):
 
@@ -20,6 +20,7 @@ class PASUserSync(BrowserView):
         portal = getToolByName(self.context, "portal_url")  .getPortalObject()
         listPlugins = portal.acl_users.plugins.listPlugins
 
+
         # Get paramitors and corrispondign objects
 
         from_pluginid = request.get ("from")
@@ -30,9 +31,11 @@ class PASUserSync(BrowserView):
         if to_pluginid is None:
             to_properties_pluginid = request.get("to_properties")
             to_manager_pluginid = request.get("to_manager")
+            to_userfactory_pluginid = request.get("to_userfactory")
         else:
             to_properties_pluginid = to_pluginid
             to_manager_pluginid = to_pluginid
+            to_userfactory_pluginid = to_pluginid
 
 
         # Get plugin objects
@@ -40,6 +43,7 @@ class PASUserSync(BrowserView):
         from_properties_plugin = None
         to_properties_plugin = None
         to_manager_plugin = None
+        to_userfactory_plugin = None
 
         for pluginId, p in listPlugins(IPropertiesPlugin):
             if p.id == from_pluginid:
@@ -52,17 +56,23 @@ class PASUserSync(BrowserView):
             if pluginId == to_manager_pluginid:
                 to_manager_plugin = p
                 break;
+                
+        for pluginId, p in listPlugins(IUserFactoryPlugin):
+            if pluginId == to_userfactory_pluginid:
+                to_userfactory_plugin = p
+                break;
+                
 
 
         # Check we have everything
 
-        if not (to_manager_plugin and to_properties_plugin and from_properties_plugin):
+        if not (to_manager_plugin and to_properties_plugin and to_userfactory_plugin and from_properties_plugin):
             raise Exception ("Cound not find needed plugin")
 
 
         # Do Sync
 
-        return self.sync (from_properties_plugin, to_manager_plugin, to_properties_plugin,)
+        return self.sync (from_properties_plugin, to_manager_plugin, to_properties_plugin, to_userfactory_plugin)
 
 
 
@@ -70,7 +80,8 @@ class PASUserSync(BrowserView):
     # Syncing
     #
 
-    def sync (self, from_properties, to_manager, to_properties):
+    def sync (self, from_properties, to_manager, to_properties, to_userfactory):
+    
 
 
         # Stats
@@ -87,12 +98,13 @@ class PASUserSync(BrowserView):
             if uid not in doneUsers:
                 doneUsers.add (uid)
 
+                logging.info ("sync %s...", uid)
+
 
                 user = self.getUser(uid)
                 if user is None:
-                    logging.info ("could not sync id: %s", uid)
+                    logging.info ("%s could not get user object.", uid)
                 else:
-                    logging.info ("syncing id: %s", uid)
 
                     # if None is returned from the followign, that would mean
                     # the plugin does not manage that user
@@ -104,29 +116,31 @@ class PASUserSync(BrowserView):
                     # Operation is determined by which pluging returns valid
                     # property sheets. 
                     if fprop and tprop:
-                        if self.sync_update (user, fprop, tprop):
-                            logging.info ("updated id: %s", uid)
+                        if self.sync_update (user, fprop, tprop, to_userfactory):
+                            logging.info ("%s: updated.", uid)
                             cupdates += 1
                         else:
-                            logging.info ("id: %s is up to date", uid)
+                            logging.info ("%s: up to date.", uid)
                             cnotupdates += 1
 
                     elif fprop and (tprop is None):
-                        self.sync_add (uid, to_manager, fprop, to_properties)
-                        logging.info ("added id: %s", uid)
+                        self.sync_add (uid, to_manager, fprop, to_properties, to_userfactory)
+                        logging.info ("%s: added.", uid)
                         cadds += 1
 
                     elif (fprop is None) and tprop:
                         self.sync_remove (uid, to_manager)
-                        logging.info ("removed id: %s", uid)
+                        logging.info ("%s: removed.", uid)
                         cremoves += 1
 
                     else:
                         # noop - Do nothing
-                        logging.info ("sync not required for id: %s", uid)
+                        logging.info ("%s: sync not required.", uid)
                         cnotupdates += 1
+                        
 
 
+                    
         return "adds=%s updates=%s removes=%s not_updated=%s" % (cadds, cupdates, cremoves, cnotupdates)
 
 
@@ -137,13 +151,14 @@ class PASUserSync(BrowserView):
     #
 
 
-    def sync_update (self, user, fprop, tprop):
-        updated = False
+    def sync_update (self, user, fprop, tprop, to_userfactory):
 
+        updated_fields = []
+        
         if isinstance (tprop, MutablePropertySheet):
 
             tpropMap = tprop.propertyMap()
-            tkeys = set([propInfo["id"] for propInfo in tpropMap])
+            tkeys = set([p["id"] for p in tpropMap])
 
             # iterate from properties
             fpropMap = fprop.propertyMap()
@@ -153,24 +168,53 @@ class PASUserSync(BrowserView):
                     fvalue = fprop.getProperty(key)
                     tvalue = tprop.getProperty(key)
                     
+                                        
                     # compare value, is diff then update
-                    if fvalue != tvalue:
-                        tprop.setProperty (user, key, fvalue)
-                        updated = True
+                    # because there are different idears of Null. we don't want to override '' with None
+                    if (fvalue or tvalue) and (fvalue != tvalue):
+                        updated_fields.append(key)
+                        tprop.setProperty (user, key, fvalue)    
+                        
+                        
 
-        return updated
+        if len(updated_fields) > 0:
 
+            if tprop.hasProperty("uid"):
+                uid = tprop.getProperty("uid")
+                referenceCatalog = getToolByName (self.portal, REFERENCE_CATALOG)
+                usero = referenceCatalog.lookupObject (uid)
+            else:
+                ruser = to_userfactory.createUser (user.getId(), user.getName())
+                if hasattr(ruser, "_getMembraneObject"):
+                    usero = ruser._getMembraneObject()
+                elif hasattr(user, "reindexObject"):
+                    usero = ruser
+                else:
+                    usero = None
+                
+            if usero is not None:
+                usero.reindexObject(updated_fields)
+                
+            return True
 
-    def sync_add (self, uid, to_manager, fprop, to_properties):
+        else:
+            return False
+        
+        
+        
+        
+
+    def sync_add (self, uid, to_manager, fprop, to_properties, to_userfactory):
         password = getToolByName(self.portal, 'portal_registration').generatePassword ()
 
         # do the deed
         to_manager.doAddUser (uid, password)
 
+
         # roperties Update
         user = self.getUser(uid)
         tprop = self.getPropertiesForUser (to_properties, user)
-        self.sync_update (user, fprop, tprop)
+        self.sync_update (user, fprop, tprop, to_userfactory)
 
 
 
@@ -189,8 +233,8 @@ class PASUserSync(BrowserView):
     def getUser (self, uid):
         try:
             user = self.portal.acl_users.getUser(uid)
-        except:
-            logging.error ("error in getting user")
+        except Exception, e:
+            logging.error ("error in getting user '%s'", e)
             user = None
         return user
     
@@ -201,11 +245,12 @@ class PASUserSync(BrowserView):
         except:
             prop = None
 
-        if prop and prop.hasProperty("fullname"): 
-            return prop
-        else:
-            import pdb; pdb.set_trace()
-            return None
+
+        if not(prop and len(prop.propertyMap())): 
+            prop = None
+            
+
+        return prop
             
 
 
