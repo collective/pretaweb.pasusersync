@@ -1,4 +1,3 @@
-
 import logging
 
 from Products.CMFCore.utils import getToolByName
@@ -6,6 +5,9 @@ from Products.Five import BrowserView
 from Products.PluggableAuthService.interfaces.plugins import IUserAdderPlugin, IPropertiesPlugin, IUserFactoryPlugin
 from Products.PlonePAS.sheet import MutablePropertySheet
 from Products.Archetypes.config import REFERENCE_CATALOG
+import transaction
+from plone.i18n.normalizer.interfaces import IURLNormalizer
+from zope.component import queryUtility
 
 class PASUserSync(BrowserView):
 
@@ -36,6 +38,10 @@ class PASUserSync(BrowserView):
             to_properties_pluginid = to_pluginid
             to_manager_pluginid = to_pluginid
             to_userfactory_pluginid = to_pluginid
+
+
+        lowercase_normalize = request.get("lowercase_normalize",False)
+        url_normalize = request.get("url_normalize",False)
 
 
         # Get plugin objects
@@ -72,7 +78,9 @@ class PASUserSync(BrowserView):
 
         # Do Sync
 
-        return self.sync (from_properties_plugin, to_manager_plugin, to_properties_plugin, to_userfactory_plugin)
+        return self.sync (from_properties_plugin, to_manager_plugin, to_properties_plugin, to_userfactory_plugin, lowercase_normalize, url_normalize)
+
+
 
 
 
@@ -80,68 +88,91 @@ class PASUserSync(BrowserView):
     # Syncing
     #
 
-    def sync (self, from_properties, to_manager, to_properties, to_userfactory):
-    
+    def sync (self, from_properties, to_manager, to_properties, to_userfactory, lowercase_normalize=False, url_normalize=False):
 
+        logging.info ("syncing...")
+
+        allUserInfos =  self.portal.acl_users.searchUsers()
+        loginSets = self.normalizedLoginSets (allUserInfos, lowercase_normalize, url_normalize)
 
         # Stats
         cadds = 0
         cremoves = 0
         cupdates = 0
         cnotupdates = 0
-
-        doneUsers = set()
-        for userInfo in self.portal.acl_users.searchUsers():
-
-            # Do sync opertaions on a valid and not-done user
-            uid = userInfo["id"]
-            if uid not in doneUsers:
-                doneUsers.add (uid)
-
-                logging.info ("sync %s...", uid)
+        saves = 0
+        for loginSet in list(loginSets):
 
 
-                user = self.getUser(uid)
-                if user is None:
-                    logging.info ("%s could not get user object.", uid)
+            # Get current User Objects from each of the plugins. A None return
+            # means the plugin doesn't have data on that user
+            userSet = self.userSetFromLogins (loginSet)
+            fprop, fuser = self.getPropertiesForUser (from_properties, userSet)
+            tprop, tuser = self.getPropertiesForUser (to_properties, userSet)
+
+
+            # Operation on the user - update, add, remove, noop.
+            # Operation is determined by which pluging returns valid
+            # property sheets. 
+            if fprop and tprop:
+                # User is in both PAS plugins - do a sync
+                result = self.sync_update (fprop, tprop, tuser, to_userfactory)
+
+                if result:
+                    logging.debug ("%s: updated.", tuser.getUserName())
+                    cupdates += 1
                 else:
-
-                    # if None is returned from the followign, that would mean
-                    # the plugin does not manage that user
-                    fprop = self.getPropertiesForUser (from_properties, user)
-                    tprop = self.getPropertiesForUser (to_properties, user)
+                    logging.debug ("%s: up to date.", tuser.getUserName())
+                    cnotupdates += 1
 
 
-                    # Operation on the user - update, add, remove, noop.
-                    # Operation is determined by which pluging returns valid
-                    # property sheets. 
-                    if fprop and tprop:
-                        if self.sync_update (user, fprop, tprop, to_userfactory):
-                            logging.info ("%s: updated.", uid)
-                            cupdates += 1
-                        else:
-                            logging.info ("%s: up to date.", uid)
-                            cnotupdates += 1
+            elif fprop and (tprop is None):
+                # User is not in the  target plugin - do an add then sync
 
-                    elif fprop and (tprop is None):
-                        self.sync_add (uid, to_manager, fprop, to_properties, to_userfactory)
-                        logging.info ("%s: added.", uid)
-                        cadds += 1
+                # Add
+                self.sync_add (fuser.getUserName(), to_manager, fprop, to_properties, to_userfactory)
 
-                    elif (fprop is None) and tprop:
-                        self.sync_remove (uid, to_manager)
-                        logging.info ("%s: removed.", uid)
-                        cremoves += 1
+                # Sync - (re retreive relivant objects from the target
+                # plugin)
+                userSet = self.userSetFromLogins (loginSet)
+                tprop, tuser = self.getPropertiesForUser (to_properties, userSet)
+                self.sync_update (fprop, tprop, tuser, to_userfactory)
 
-                    else:
-                        # noop - Do nothing
-                        logging.info ("%s: sync not required.", uid)
-                        cnotupdates += 1
-                        
+                logging.debug ("%s: added.", fuser.getUserName())
+                cadds += 1
 
 
-                    
-        return "adds=%s updates=%s removes=%s not_updated=%s" % (cadds, cupdates, cremoves, cnotupdates)
+            elif (fprop is None) and tprop:
+                loggin = tuser.getUserName() # get login to display on debug
+
+                # User is nolonger in the source plugin - do a remove
+                userId = tuser.getUserId()
+                self.sync_remove (userId, to_manager)
+
+                logging.debug ("%s: removed.", loggin)
+                cremoves += 1
+
+
+            else:
+
+                # User does not exist in relivant plugins - do nothing
+                
+                logging.info ("(%s): user(s) does not exist in relivant plugins.", str(loginSet))
+                cnotupdates += 1
+
+
+                
+            # Do a commit point every 20 database changes
+            if (((cupdates + cremoves + cadds) / 20.0) - saves) > 1.0:
+                transaction.commit()
+                saves += 1
+                logging.debug ("-- commit point --")
+
+
+        results = "sync done (adds=%s updates=%s removes=%s not_updated=%s)" % (cadds, cupdates, cremoves, cnotupdates)
+
+        logging.info (results)
+        return results
 
 
 
@@ -151,9 +182,26 @@ class PASUserSync(BrowserView):
     #
 
 
-    def sync_update (self, user, fprop, tprop, to_userfactory):
+    def sync_update (self, fprop, tprop, tuser ,to_userfactory):
+
+
+
+        # Helper functions
+        def pkeys (prop):
+            if type(prop) == dict:
+                return prop.keys()
+            propMap = prop.propertyMap()
+            return [p["id"] for p in propMap]
+
+        def pget (prop, key):
+            if type(prop) == dict:
+                return prop.get(key)
+            return prop.getProperty(key)
+
+
 
         updated_fields = []
+
         
         if isinstance (tprop, MutablePropertySheet):
 
@@ -161,22 +209,30 @@ class PASUserSync(BrowserView):
             tkeys = set([p["id"] for p in tpropMap])
 
             # iterate from properties
-            fpropMap = fprop.propertyMap()
-            for propInfo in fpropMap:
-                key = propInfo["id"]
+            for key in pkeys(fprop):
                 if key in tkeys:
-                    fvalue = fprop.getProperty(key)
+                    fvalue = pget(fprop, key)
                     tvalue = tprop.getProperty(key)
-                    
+
+                    # Test if tvalue is unicodable, otherwise set to None to
+                    # re-set
+                    try:
+                        tvalue = tvalue.decode("utf8")
+                    except UnicodeDecodeError:
+                        tvalue = None
                                         
                     # compare value, is diff then update
-                    # because there are different idears of Null. we don't want to override '' with None
+                    # because there are different idears of Null. we don't want
+                    # to override '' with None. 
+                    #
+                    # Test based on type first - because we want to be storing
+                    # unicode strings.
                     if (fvalue or tvalue) and (fvalue != tvalue):
                         updated_fields.append(key)
-                        tprop.setProperty (user, key, fvalue)    
-                        
-                        
+                        tprop.setProperty (tuser, key, fvalue)    
 
+                        
+                        
         if len(updated_fields) > 0:
 
             if tprop.hasProperty("uid"):
@@ -184,7 +240,7 @@ class PASUserSync(BrowserView):
                 referenceCatalog = getToolByName (self.portal, REFERENCE_CATALOG)
                 usero = referenceCatalog.lookupObject (uid)
             else:
-                ruser = to_userfactory.createUser (user.getId(), user.getName())
+                ruser = to_userfactory.createUser (tuser.getId(), tuser.getName())
                 if hasattr(ruser, "_getMembraneObject"):
                     usero = ruser._getMembraneObject()
                 elif hasattr(user, "reindexObject"):
@@ -201,26 +257,17 @@ class PASUserSync(BrowserView):
             return False
         
         
-        
-        
 
-    def sync_add (self, uid, to_manager, fprop, to_properties, to_userfactory):
+    def sync_add (self, login, to_manager, fprop, to_properties, to_userfactory):
         password = getToolByName(self.portal, 'portal_registration').generatePassword ()
 
         # do the deed
-        to_manager.doAddUser (uid, password)
+        to_manager.doAddUser (login, password)
 
 
-        # roperties Update
-        user = self.getUser(uid)
-        tprop = self.getPropertiesForUser (to_properties, user)
-        self.sync_update (user, fprop, tprop, to_userfactory)
+    def sync_remove (self, login, to_manager):
+        to_manager.doDeleteUser (login)
 
-
-
-
-    def sync_remove (self, uid, to_manager):
-        to_manager.doDeleteUser (uid)
 
 
 
@@ -230,29 +277,81 @@ class PASUserSync(BrowserView):
     #
 
 
-    def getUser (self, uid):
+    def getUser (self, login):
         try:
-            user = self.portal.acl_users.getUser(uid)
+            user = self.portal.acl_users.getUser(login)
         except Exception, e:
             logging.error ("error in getting user '%s'", e)
             user = None
         return user
     
 
-    def getPropertiesForUser (self, plugin, user):
-        try:
-            prop = plugin.getPropertiesForUser(user)
-        except:
-            prop = None
+    def getPropertiesForUser (self, plugin, userSet):
+        for user in userSet:
+            try:
+                prop = plugin.getPropertiesForUser(user)
+            except:
+                prop = None
+
+            if type(prop) == dict and len(prop):
+                return prop, user
+
+            if prop and len(prop.propertyMap()):
+                return prop, user
+                
+        return None, None
 
 
-        if not(prop and len(prop.propertyMap())): 
-            prop = None
-            
+    def userSetFromLogins (self, logins):
 
-        return prop
-            
+        # produce a set of user objects from the logins
+
+        userSet = set()
+
+        doneLogins = set()
+        for login in logins:
+            user = self.getUser(login) # note: this may work better to iterrate thourgh the PAS plugins
+            if user and user.getUserName() not in doneLogins:
+                userSet.add(user)
+            doneLogins.add(login)
+
+        return userSet
 
 
+    def normalizedLoginSets (self, userInfos, lowercase_normalize, url_normalize):
+
+        normalize = queryUtility (IURLNormalizer).normalize
+
+        logging.info ("Reading logins...")
+        loginList = {}
+        for userInfo in userInfos: 
+            login = userInfo["login"]
+
+            loginsNormalized = set([login])
+            if lowercase_normalize:
+                loginsNormalized.add (login.lower())
+
+            if url_normalize:
+                more = set()
+                for l in loginsNormalized:
+                    more.add(normalize(l))
+                loginsNormalized = loginsNormalized | more
+
+            loginSet = set(loginsNormalized)
+
+            # add in sets allready in the loginList which are equivilent sets
+            for l in loginsNormalized:
+                lset = loginList.get(l)
+                if lset:
+                    loginSet.update(lset)
+
+            # reset each indexed login to the same set
+            for l in loginSet:
+                loginList[l] = frozenset(loginSet)
+
+
+        return set(loginList.values())
+
+       
 
 
